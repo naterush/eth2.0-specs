@@ -20,6 +20,9 @@ def constrict_generalized_index(x, q):
         return None
     return o
 
+def is_generalized_index_child(c, a):
+    return False if c < a else True if c == a else is_generalized_index_child(c // 2, a)
+
 def unrebase(objs, q):
     o = {}
     for k,v in objs.items():
@@ -68,18 +71,6 @@ def ssz_leaves(obj, typ=None, root=1):
         #print(obj, root, typ, base, list(q.keys()))
         return(q)
 
-def fill(objects):
-    objects = {k:v for k,v in objects.items()}
-    keys = sorted(objects.keys())[::-1]
-    pos = 0
-    while pos < len(keys):
-        k = keys[pos]
-        if k in objects and k^1 in objects and k//2 not in objects:
-            objects[k//2] = hash(objects[k&-2] + objects[k|1])
-            keys.append(k // 2)
-        pos += 1
-    return objects
-
 @infer_input_type
 def ssz_full(obj, typ=None):
     return fill(ssz_leaves(obj, typ=typ))
@@ -97,7 +88,9 @@ def get_bottom_layer_element_position(typ, base, length, index):
     Returns the generalized index and the byte range of the index'th value
     in the list with the given base generalized index and given length
     """
-    assert index < (1 if is_basic_type(typ) else length)
+    L = 1 if is_basic_type(typ) else length
+    if index >= L:
+        raise IndexError("list index {} out of range (length {})".format(index, L))
     elem_typ = typ if is_basic_type(typ) else read_elem_type(typ)
     elem_size = get_basic_type_size(elem_typ)
     chunk_index = index * elem_size // 32
@@ -107,36 +100,41 @@ def get_bottom_layer_element_position(typ, base, length, index):
     return generalized_index, start, start+elem_size
 
 @infer_input_type
-def get_generalized_indices(obj, path, typ=None, root=1):
-    if len(path) == 0:
-        return [root] if is_basic_type(typ) else list(ssz_leaves(obj, typ=typ, root=root).keys())
-    if path[0] == '__len__':
-        return [root * 2 + 1] if is_list_type(typ) else []
-    base = root * 2 if is_list_kind(typ) else root
-    if is_bottom_layer_kind(typ):
-        length = 1 if is_basic_type(typ) else len(obj)
-        index, _, _ = get_bottom_layer_element_position(typ, base, length, path[0])
-        return [index]
-    else:
-        if is_container_type(typ):
-            fields = typ.get_field_names()
-            field_count, index = len(fields), fields.index(path[0])
-            elem_type = typ.get_field_types()[index]
-            child = obj.get_field_values()[index]
+def descend(obj, path, typ=None):
+    for p in path:
+        if isinstance(p, int):
+            if obj is not None:
+                obj = obj[p]
+            typ = read_elem_type(typ)
+        elif p == '__len__':
+            if obj is not None:
+                obj = len(obj)
+            typ = uint64
+        elif isinstance(p, str):
+            if obj is not None:
+                obj = getattr(obj, p)
+            typ = typ.get_fields_dict()[p]
         else:
-            field_count, index, elem_type, child = len(obj), path[0], read_elem_type(typ), obj[path[0]]
-        return get_generalized_indices(
-            child,
-            path[1:],
-            typ=elem_type,
-            root=base * next_power_of_two(field_count) + index
-        )
+            raise Exception("Unknown path element {}".format(p))
+    return obj, typ
 
 def get_branch_indices(tree_index):
-    o = [tree_index, tree_index ^ 1]
+    o = [tree_index ^ 1]
     while o[-1] > 1:
         o.append((o[-1] // 2) ^ 1)
     return o[:-1]
+
+def fill(objects):
+    objects = {k:v for k,v in objects.items()}
+    keys = sorted(objects.keys())[::-1]
+    pos = 0
+    while pos < len(keys):
+        k = keys[pos]
+        if k in objects and k^1 in objects and k//2 not in objects:
+            objects[k//2] = hash(objects[k&-2] + objects[k|1])
+            keys.append(k // 2)
+        pos += 1
+    return objects
 
 def remove_redundant_indices(obj):
     return {k:v for k,v in obj.items() if not (k*2 in obj and k*2+1 in obj)}
@@ -144,75 +142,135 @@ def remove_redundant_indices(obj):
 def merge(*args):
     o = {}
     for arg in args:
-        o = {**o, **arg}
-    return fill(o)
-
-@infer_input_type
-def get_nodes_along_path(obj, path, typ=None):
-    indices = get_generalized_indices(obj, path, typ=typ)
-    return remove_redundant_indices(merge(*({i:obj.objects[i] for i in get_branch_indices(index)} for index in indices)))
+        assert arg.typ == args[0].typ
+        o = {**o, **arg.objects}
+    return ssz_partial(args[0].typ, remove_redundant_indices(fill(o)))
 
 class OutOfRangeException(Exception):
     pass
 
 class SSZPartial():
-    def __init__(self, typ, objects, root=1):
+    def __init__(self, typ, objects):
         assert not is_basic_type(typ)
         self.objects = objects
         self.typ = typ
-        self.root = root
-        if is_container_type(self.typ):
-            for field in self.typ.get_field_names():
-                try:
-                    setattr(self, field, self.getter(field))
-                except OutOfRangeException:
-                    pass
+
+    def access_partial(self, path):
+        gindex = self.get_generalized_index(path)
+        branch_indices = {k: self.objects[k] for k in get_branch_indices(gindex)}
+        _, bottom_typ = descend(None, path, typ=self.typ)
+        if is_basic_type(bottom_typ):
+            leaf_indices = {gindex: self.objects[gindex]}
+        else:
+            leaf_indices = ssz_leaves(self.execute_path(path), typ=bottom_typ, root=gindex)
+        return SSZPartial(self.typ, {**branch_indices, **leaf_indices})
+
+    def merge(self, target):
+        assert self.typ == target.typ
+        return SSZPartial(self.typ, {**self.objects, **target.objects})
+
+    def get_generalized_index(self, path):
+        root = 1
+        typ = self.typ
+        for p in path:
+            if p == '__len__':
+                return root * 2 + 1 if is_list_kind(typ) else None
+            base = root * 2 if is_list_kind(typ) else root
+            length = (
+                1 if is_basic_type(typ) else typ.length if is_vector_kind(typ) else
+                len(typ.get_field_names()) if is_container_type(typ) else int.from_bytes(self.objects[root * 2 + 1], 'little')
+            )
+            if is_bottom_layer_kind(typ):
+                root, _, _ = get_bottom_layer_element_position(typ, base, length, p)
+            else:
+                if is_container_type(typ):
+                    index = typ.get_field_names().index(p)
+                    typ = typ.get_field_types()[index]
+                elif is_vector_kind(typ) or is_list_kind(typ):
+                    index, typ = p, read_elem_type(typ)
+                else:
+                    raise Exception("Unknown type: {}".format(typ))
+                root = base * next_power_of_two(length) + index
+        return root
+
+    def execute_path(self, path):
+        tree_index = self.get_generalized_index(path)
+        if tree_index is None and path[-1] == '__len__':
+            _, bottom_typ = descend(None, path[:-1], typ=self.typ)
+            return bottom_typ.length
+        _, bottom_typ = descend(None, path, typ=self.typ)
+        if is_basic_type(bottom_typ):
+            basic_type_size = get_basic_type_size(bottom_typ)
+            bottom_index = path[-1] if path and isinstance(path[-1], int) else 0
+            start = bottom_index * basic_type_size % 32
+            return deserialize_basic(self.objects[tree_index][start:start+basic_type_size], bottom_typ)
+        elif is_list_kind(bottom_typ):
+            L = self.execute_path(path+['__len__'])
+            o = [self.execute_path(path+[i]) for i in range(L)]
+            return bytes(o) if is_bytes_type(bottom_typ) else o
+        elif is_vector_kind(bottom_typ):
+            o = bottom_typ(*(self.execute_path(path+[i]) for i in range(bottom_typ.length)))
+            return bytes(o) if is_bytesn_type(bottom_typ) else o
+        elif is_container_type(bottom_typ):
+            return bottom_typ(**{field: self.execute_path(path+[field]) for field in bottom_typ.get_field_names()})
+        else:
+            raise Exception("Unrecognized type")
+
+    def set_path(self, path, value):
+        tree_index = self.get_generalized_index(path)
+        if tree_index is None and path[-1] == '__len__':
+            raise Exception("Cannot set length")
+        _, bottom_typ = descend(None, path, typ=self.typ)
+        if is_basic_type(bottom_typ):
+            basic_type_size = get_basic_type_size(bottom_typ)
+            bottom_index = path[-1] if path and isinstance(path[-1], int) else 0
+            start = bottom_index * basic_type_size % 32
+            self.objects[tree_index] = (
+                self.objects[tree_index][:start] +
+                serialize_basic(value, bottom_typ) +
+                self.objects[tree_index][start+basic_type_size:]
+            )
+        else:
+            for k in list(self.objects.keys()):
+                if is_generalized_index_child(k, tree_index):
+                    del self.objects[k]
+            new_keys = ssz_leaves(value, typ=bottom_typ, root=tree_index)
+            for k, v in new_keys.items():
+                self.objects[k] = v
+        v = tree_index // 2
+        while v:
+            if v not in self.objects:
+                break
+            self.objects[v] = hash(self.objects[v * 2] + self.objects[v * 2 + 1])
+            v //= 2
+
+class SSZPartialPointer():
+    def __init__(self, ssz_partial, path, typ):
+        self.ssz_partial = ssz_partial
+        self.path = path
+        self.typ = typ
 
     def getter(self, index):
-        base = self.root * 2 if is_list_kind(self.typ) else self.root
-        if is_bottom_layer_kind(self.typ):
-            tree_index, start, end = get_bottom_layer_element_position(
-                self.typ, base, len(self), index
-            )
-            if tree_index not in self.objects:
-                raise OutOfRangeException("Do not have required data")
-            else:
-                return deserialize_basic(
-                    self.objects[tree_index][start:end],
-                    self.typ if is_basic_type(self.typ) else read_elem_type(self.typ)
-                )
+        _, elem_type = descend(None, [index], typ=self.typ)
+        if is_basic_type(elem_type):
+            return self.ssz_partial.execute_path(self.path + [index])
         else:
-            if is_container_type(self.typ):
-                fields = self.typ.get_field_names()
-                field_count, index = len(fields), fields.index(index)
-                elem_type = self.typ.get_field_types()[index]
-            else:
-                field_count, index, elem_type = len(self), index, read_elem_type(self.typ)
-            tree_index = base * next_power_of_two(field_count) + index
-            if tree_index not in self.objects:
-                raise OutOfRangeException("Do not have required data")
-            if is_basic_type(elem_type):
-                return deserialize_basic(self.objects[tree_index][:get_basic_type_size(elem_type)], elem_type)
-            else:
-                return ssz_partial(elem_type, self.objects, root=tree_index)
+            return mk_ssz_pointer(self.ssz_partial, self.path + [index], elem_type)
+
+    def setter(self, index, value):
+        self.ssz_partial.set_path(self.path + [index], value)
+
+    def __len__(self):
+        return self.getter('__len__')
 
     def __getitem__(self, index):
         return self.getter(index)
 
+    def __setitem__(self, index, value):
+        return self.setter(index, value)
+
     def __iter__(self):
         return (self[i] for i in range(len(self)))
-
-    def __len__(self):
-        if is_list_kind(self.typ):
-            if self.root*2+1 not in self.objects:
-                raise OutOfRangeException("Do not have required data: {}".format(self.root*2+1))
-            return int.from_bytes(self.objects[self.root*2+1], 'little')
-        elif is_vector_kind(self.typ):
-            return self.typ.length
-        elif is_container_type(self.typ):
-            return len(self.typ.get_fields())
-        else:
-            raise Exception("Unsupported type: {}".format(self.typ))
 
     def full_value(self):
         if is_bytes_type(self.typ) or is_bytesn_type(self.typ):
@@ -230,7 +288,7 @@ class SSZPartial():
             raise Exception("Unsupported type: {}".format(self.typ))
 
     def hash_tree_root(self):
-        o = {**self.objects}
+        o = {k:v for k,v in self.ssz_partial.objects.items() if is_generalized_index_child(k, self.root)}
         keys = sorted(o.keys())[::-1]
         pos = 0
         while pos < len(keys):
@@ -244,14 +302,24 @@ class SSZPartial():
     def __str__(self):
         return str(self.full_value())
 
-def ssz_partial(typ, objects, root=1):
+    @property
+    def root(self):
+        return self.ssz_partial.get_generalized_index(self.path)
+
+def ssz_partial(typ, objects, path=None):
+    return mk_ssz_pointer(SSZPartial(typ, objects), path or [], typ)
+
+def mk_ssz_pointer(partial, path, typ):
     ssz_type = (
         Container if is_container_type(typ) else
         typ if (is_vector_type(typ) or is_bytesn_type(typ)) else object
     )
-    class Partial(SSZPartial, ssz_type):
+    class Pointer(SSZPartialPointer, ssz_type):
         pass
     if is_container_type(typ):
-        Partial.__annotations__ = typ.__annotations__
-    o = Partial(typ, objects, root=root)
-    return o
+        Pointer.__annotations__ = typ.__annotations__
+        for f in typ.get_field_names():
+            getter = (lambda arg: lambda self: self.getter(arg))(f)
+            setter = (lambda arg: lambda self, value: self.setter(arg, value))(f)
+            setattr(Pointer, f, property(getter, setter))
+    return Pointer(partial, path or [], typ)
