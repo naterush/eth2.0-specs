@@ -32,6 +32,8 @@ def unrebase(objs, q):
     return o
 
 def filler(starting_position, chunk_count):
+    if chunk_count == 0:
+        return {}
     at, skip, end = chunk_count, 1, next_power_of_two(chunk_count)
     value = ZERO_CHUNK
     o = {}
@@ -83,6 +85,9 @@ def get_basic_type_size(typ):
     else:
         raise Exception("Type not basic: {}".format(typ))
 
+def get_chunk_count(elem_size, length):
+    return (length - 1) * elem_size // 32 + 1
+
 def get_bottom_layer_element_position(typ, base, length, index):
     """
     Returns the generalized index and the byte range of the index'th value
@@ -94,7 +99,7 @@ def get_bottom_layer_element_position(typ, base, length, index):
     elem_typ = typ if is_basic_type(typ) else read_elem_type(typ)
     elem_size = get_basic_type_size(elem_typ)
     chunk_index = index * elem_size // 32
-    chunk_count = (1 if is_basic_type(typ) else length) * elem_size // 32
+    chunk_count = get_chunk_count(elem_size, 1 if is_basic_type(typ) else length)
     generalized_index = base * next_power_of_two(chunk_count) + chunk_index
     start = elem_size * index % 32
     return generalized_index, start, start+elem_size
@@ -219,7 +224,7 @@ class SSZPartial():
     def set_path(self, path, value):
         tree_index = self.get_generalized_index(path)
         if tree_index is None and path[-1] == '__len__':
-            raise Exception("Cannot set length")
+            raise Exception("Cannot set length of empty list")
         _, bottom_typ = descend(None, path, typ=self.typ)
         if is_basic_type(bottom_typ):
             basic_type_size = get_basic_type_size(bottom_typ)
@@ -231,9 +236,7 @@ class SSZPartial():
                 self.objects[tree_index][start+basic_type_size:]
             )
         else:
-            for k in list(self.objects.keys()):
-                if is_generalized_index_child(k, tree_index):
-                    del self.objects[k]
+            self.clear_subtree(tree_index)
             new_keys = ssz_leaves(value, typ=bottom_typ, root=tree_index)
             for k, v in new_keys.items():
                 self.objects[k] = v
@@ -243,6 +246,61 @@ class SSZPartial():
                 break
             self.objects[v] = hash(self.objects[v * 2] + self.objects[v * 2 + 1])
             v //= 2
+
+    def clear_subtree(self, tree_index):
+        for k in list(self.objects.keys()):
+            if is_generalized_index_child(k, tree_index):
+                del self.objects[k]
+
+    def append(self, path, value):
+        self.pop_or_append(path, value, True)
+
+    def pop(self, path):
+        self.pop_or_append(path, None, False)
+
+    def pop_or_append(self, path, value, appending):
+        list_root_index = self.get_generalized_index(path)
+        pre_length = int.from_bytes(self.objects[list_root_index * 2 + 1], 'little')
+        post_length = pre_length + (1 if appending else -1)
+        _, list_type = descend(None, path, typ=self.typ)
+        elem_type = read_elem_type(list_type)
+        basic_type_size = get_basic_type_size(elem_type) if is_basic_type(elem_type) else 32
+        pre_chunk_count = get_chunk_count(basic_type_size, pre_length)
+        post_chunk_count = get_chunk_count(basic_type_size, post_length)
+        pre_start_pos = list_root_index * 2 * next_power_of_two(pre_chunk_count)
+        post_start_pos = list_root_index * 2 * next_power_of_two(post_chunk_count)
+        old_filler = filler(pre_start_pos, pre_chunk_count)
+        for k in old_filler:
+            assert self.objects[k] == old_filler[k]
+            del self.objects[k]
+        if not appending:
+            if is_basic_type(elem_type):
+                self.set_path(path + [pre_length-1], get_zero_value(elem_type))
+            else:
+                self.clear_subtree(self.get_generalized_index(path + [pre_length-1]))
+        self.objects[list_root_index * 2 + 1] = post_length.to_bytes(32, 'little')
+        if next_power_of_two(post_chunk_count) != next_power_of_two(pre_chunk_count):
+            if post_chunk_count > pre_chunk_count:
+                old_root, new_root = list_root_index * 2, list_root_index * 4
+            else:
+                old_root, new_root = list_root_index * 4, list_root_index * 2
+            new = {}
+            for k in list(self.objects.keys()):
+                if is_generalized_index_child(k, old_root):
+                    new_index = concat_generalized_indices(new_root, constrict_generalized_index(k, old_root))
+                    new[new_index] = self.objects[k]
+                    del self.objects[k]
+            for k, v in new.items():
+                self.objects[k] = v
+        new_filler = filler(post_start_pos, post_chunk_count)
+        for k in new_filler:
+            self.objects[k] = new_filler[k]
+        if appending:
+            if is_basic_type(elem_type):
+                gindex = self.get_generalized_index(path + [pre_length])
+                if gindex not in self.objects:
+                    self.objects[gindex] = b'\x00' * 32
+            self.set_path(path + [pre_length], value)
 
 class SSZPartialPointer():
     def __init__(self, ssz_partial, path, typ):
@@ -322,4 +380,7 @@ def mk_ssz_pointer(partial, path, typ):
             getter = (lambda arg: lambda self: self.getter(arg))(f)
             setter = (lambda arg: lambda self, value: self.setter(arg, value))(f)
             setattr(Pointer, f, property(getter, setter))
+    elif is_list_kind(typ):
+        Pointer.append = lambda self, value: self.ssz_partial.append(self.path, value)
+        Pointer.pop = lambda self: self.ssz_partial.pop(self.path)
     return Pointer(partial, path or [], typ)

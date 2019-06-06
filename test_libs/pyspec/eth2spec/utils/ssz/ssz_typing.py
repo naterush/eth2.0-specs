@@ -495,7 +495,7 @@ def read_elem_type(typ):
         return read_list_elem_type(typ)
     elif is_vector_type(typ):
         return read_vector_elem_type(typ)
-    elif issubclass(typ, bytes):
+    elif is_bytesn_type(typ):
         return byte
     else:
         raise TypeError("Unexpected type: {}".format(typ))
