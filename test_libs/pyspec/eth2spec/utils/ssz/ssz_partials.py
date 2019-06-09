@@ -154,29 +154,43 @@ def merge(*args):
 class OutOfRangeException(Exception):
     pass
 
-class SSZPartial():
-    def __init__(self, typ, objects):
-        assert not is_basic_type(typ)
+class SSZPartialMeta(type):
+    def __new__(cls, class_name, parents, attrs):
+        out = type.__new__(cls, class_name, parents, attrs)
+        if 'typ' in attrs:
+            setattr(out, 'typ', attrs['typ'])
+        out._name = 'SSZPartial'
+        return out
+
+    def __getitem__(self, typ):
+        return self.__class__(self.__name__, (SSZPartial,), {'typ': typ})
+
+class SSZPartial(Container, metaclass=SSZPartialMeta):
+    indices: List[uint64]
+    nodes: List[BytesN[32]]
+
+    def __init__(self, objects):
         self.objects = objects
-        self.typ = typ
+        assert hasattr(self.__class__, 'typ')
+        assert not is_basic_type(self.__class__.typ)
 
     def access_partial(self, path):
         gindex = self.get_generalized_index(path)
         branch_indices = {k: self.objects[k] for k in get_branch_indices(gindex)}
-        _, bottom_typ = descend(None, path, typ=self.typ)
+        _, bottom_typ = descend(None, path, typ=self.__class__.typ)
         if is_basic_type(bottom_typ):
             leaf_indices = {gindex: self.objects[gindex]}
         else:
             leaf_indices = ssz_leaves(self.execute_path(path), typ=bottom_typ, root=gindex)
-        return SSZPartial(self.typ, {**branch_indices, **leaf_indices})
+        return SSZPartial[self.__class__.typ]({**branch_indices, **leaf_indices})
 
     def merge(self, target):
-        assert self.typ == target.typ
-        return SSZPartial(self.typ, {**self.objects, **target.objects})
+        assert self.__class__.typ == target.typ
+        return SSZPartial[self.__class__.typ](self.__class__.typ, {**self.objects, **target.objects})
 
     def get_generalized_index(self, path):
         root = 1
-        typ = self.typ
+        typ = self.__class__.typ
         for p in path:
             if p == '__len__':
                 return root * 2 + 1 if is_list_kind(typ) else None
@@ -201,9 +215,9 @@ class SSZPartial():
     def execute_path(self, path):
         tree_index = self.get_generalized_index(path)
         if tree_index is None and path[-1] == '__len__':
-            _, bottom_typ = descend(None, path[:-1], typ=self.typ)
+            _, bottom_typ = descend(None, path[:-1], typ=self.__class__.typ)
             return bottom_typ.length
-        _, bottom_typ = descend(None, path, typ=self.typ)
+        _, bottom_typ = descend(None, path, typ=self.__class__.typ)
         if is_basic_type(bottom_typ):
             basic_type_size = get_basic_type_size(bottom_typ)
             bottom_index = path[-1] if path and isinstance(path[-1], int) else 0
@@ -225,7 +239,7 @@ class SSZPartial():
         tree_index = self.get_generalized_index(path)
         if tree_index is None and path[-1] == '__len__':
             raise Exception("Cannot set length of empty list")
-        _, bottom_typ = descend(None, path, typ=self.typ)
+        _, bottom_typ = descend(None, path, typ=self.__class__.typ)
         if is_basic_type(bottom_typ):
             basic_type_size = get_basic_type_size(bottom_typ)
             bottom_index = path[-1] if path and isinstance(path[-1], int) else 0
@@ -262,7 +276,7 @@ class SSZPartial():
         list_root_index = self.get_generalized_index(path)
         pre_length = int.from_bytes(self.objects[list_root_index * 2 + 1], 'little')
         post_length = pre_length + (1 if appending else -1)
-        _, list_type = descend(None, path, typ=self.typ)
+        _, list_type = descend(None, path, typ=self.__class__.typ)
         elem_type = read_elem_type(list_type)
         basic_type_size = get_basic_type_size(elem_type) if is_basic_type(elem_type) else 32
         pre_chunk_count = get_chunk_count(basic_type_size, pre_length)
@@ -284,6 +298,8 @@ class SSZPartial():
                 old_root, new_root = list_root_index * 2, list_root_index * 4
             else:
                 old_root, new_root = list_root_index * 4, list_root_index * 2
+            if new_root < old_root:
+                self.clear_subtree(old_root + 1)
             new = {}
             for k in list(self.objects.keys()):
                 if is_generalized_index_child(k, old_root):
@@ -302,6 +318,48 @@ class SSZPartial():
                     self.objects[gindex] = b'\x00' * 32
             self.set_path(path + [pre_length], value)
 
+    def get_data_leaves(self, path=None, typ=None):
+        path = path or []
+        typ=typ or self.__class__.typ
+        root = self.get_generalized_index(path)
+        if is_list_kind(typ) and root * 2 + 1 not in self.objects:
+            return []
+        length = (
+            1 if is_basic_type(typ) else typ.length if is_vector_kind(typ) else
+            len(typ.get_field_names()) if is_container_type(typ) else int.from_bytes(self.objects[root * 2 + 1], 'little')
+        )
+        o = []
+        if is_basic_type(typ):
+            index = self.get_generalized_index(path)
+            if index in self.objects:
+                o.append(index)
+        elif is_bottom_layer_kind(typ):
+            for k in range(self.get_generalized_index(path + [0]), self.get_generalized_index(path + [length-1]) + 1):
+                if k in self.objects:
+                    o.append(k)
+        elif is_container_type(typ):
+            for field, subtyp in typ.get_fields():
+                o.extend(self.get_data_leaves(path+[field], subtyp))
+        else:
+            subtyp = read_elem_type(typ)
+            for i in range(length):
+                o.extend(self.get_data_leaves(path+[i], subtyp))
+        return o
+
+    @property
+    def indices(self):
+        return self.get_data_leaves()
+
+    @property
+    def extended_indices(self):
+        branches = sum([get_branch_indices(i) for i in self.indices], [])
+        branches += [x ^ 1 for x in branches] + [1]
+        return list(set([x for x in branches if x*2 not in branches or x*2+1 not in branches]))
+
+    @property
+    def nodes(self):
+        return [self.objects[x] for x in self.extended_indices]
+
 class SSZPartialPointer():
     def __init__(self, ssz_partial, path, typ):
         self.ssz_partial = ssz_partial
@@ -314,6 +372,9 @@ class SSZPartialPointer():
             return self.ssz_partial.execute_path(self.path + [index])
         else:
             return mk_ssz_pointer(self.ssz_partial, self.path + [index], elem_type)
+
+    def get32(self, index):
+        return self.ssz_partial.objects[self.ssz_partial.get_generalized_index(self.path + [index])]
 
     def setter(self, index, value):
         self.ssz_partial.set_path(self.path + [index], value)
@@ -332,7 +393,8 @@ class SSZPartialPointer():
 
     def full_value(self):
         if is_bytes_type(self.typ) or is_bytesn_type(self.typ):
-            return bytes([self.getter(i) for i in range(len(self))])
+            L = len(self)
+            return b''.join([self.get32(i) for i in range(0, L, 32)])[:L]
         elif is_list_kind(self.typ):
             return [self[i] for i in range(len(self))]
         elif is_vector_kind(self.typ):
@@ -365,7 +427,7 @@ class SSZPartialPointer():
         return self.ssz_partial.get_generalized_index(self.path)
 
 def ssz_partial(typ, objects, path=None):
-    return mk_ssz_pointer(SSZPartial(typ, objects), path or [], typ)
+    return mk_ssz_pointer(SSZPartial[typ](objects), path or [], typ)
 
 def mk_ssz_pointer(partial, path, typ):
     ssz_type = (

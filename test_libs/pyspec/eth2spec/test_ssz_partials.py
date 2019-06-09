@@ -86,3 +86,8 @@ for i in range(99, -1, -1):
     p.people[4].name.pop()
     assert p.people[4].name.full_value() == b"Evan" + b"!" * i
 print("Append and pop tests passed")
+print(p.ssz_partial.get_data_leaves(['coords'], Vector[uint64, 2]))
+print(p.ssz_partial.get_data_leaves(['people'], List[Person]))
+print(p.ssz_partial.get_data_leaves())
+# print(p.ssz_partial.extended_indices, list(p.ssz_partial.objects.keys()), [x for x in p.ssz_partial.objects if x not in p.ssz_partial.extended_indices])
+print("SSZ partial length", len(serialize(p.ssz_partial)))
