@@ -10,9 +10,6 @@ def last_power_of_two(x):
 def concat_generalized_indices(x, y):
     return x * last_power_of_two(y) + y - last_power_of_two(y)
 
-def rebase(objs, new_root):
-    return {concat_generalized_indices(new_root, k): v for k,v in objs.items()}
-
 def constrict_generalized_index(x, q):
     depth = last_power_of_two(x // q)
     o = depth + x - q * depth
@@ -22,14 +19,6 @@ def constrict_generalized_index(x, q):
 
 def is_generalized_index_child(c, a):
     return False if c < a else True if c == a else is_generalized_index_child(c // 2, a)
-
-def unrebase(objs, q):
-    o = {}
-    for k,v in objs.items():
-        new_k = constrict_generalized_index(k, q)
-        if new_k is not None:
-            o[new_k] = v
-    return o
 
 def filler(starting_position, chunk_count):
     if chunk_count == 0:
@@ -61,17 +50,13 @@ def ssz_leaves(obj, typ=None, root=1):
         base = root
     if is_bottom_layer_kind(typ):
         data = serialize_basic(obj, typ) if is_basic_type(typ) else pack(obj, read_elem_type(typ))
-        q = {**o, **merkle_tree_of_chunks(chunkify(data), base)}
-        #print(obj, root, typ, base, list(q.keys()))
-        return(q)
+        return {**o, **merkle_tree_of_chunks(chunkify(data), base)}
     else:
         fields = get_typed_values(obj, typ=typ)
         sub_base = base * next_power_of_two(len(fields))
         for i, (elem, elem_type) in enumerate(fields):
             o = {**o, **ssz_leaves(elem, typ=elem_type, root=sub_base+i)}
-        q = {**o, **filler(sub_base, len(fields))}
-        #print(obj, root, typ, base, list(q.keys()))
-        return(q)
+        return {**o, **filler(sub_base, len(fields))}
 
 @infer_input_type
 def ssz_full(obj, typ=None):
