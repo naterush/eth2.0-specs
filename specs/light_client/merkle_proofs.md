@@ -34,7 +34,7 @@ In a binary Merkle tree, we define a "generalized index" of a node as `2**depth 
    ...
 ```
 
-Note that the generalized index has the convenient property that the two children of node `k` are `2k` and `2k+1`, and also that it equals the position of a node in the linear representation of the Merkle tree that's computed by this function:
+Note that the generalized index has the convenient property that the two children of node `k` are `2k` and `2k+1`, and also that a node's generalized index equals the position of a node in the linear representation of the Merkle tree that's computed by this function:
 
 ```python
 def merkle_tree(leaves: List[Bytes32]) -> List[Bytes32]:
@@ -48,20 +48,20 @@ We will define Merkle proofs in terms of generalized indices.
 
 ## SSZ object to index
 
-We can describe the hash tree of any SSZ object, rooted in `hash_tree_root(object)`, as a binary Merkle tree whose depth may vary. For example, an object `{x: bytes32, y: List[uint64]}` would look as follows:
+As is defined in the [SSZ specification](https://github.com/ethereum/eth2.0-specs/blob/dev/specs/simple-serialize.md#merkleization), we can describe the hash tree of any SSZ object, rooted in `hash_tree_root(object)`, as a binary Merkle tree whose depth may vary. For example, an object `foo = {x: bytes32, y: List[{w: uint256}]}` would look as follows:
 
 ```
      root
     /    \
    x    y_root
         /    \
-y_data_root  len(y)
+y_data_root  max_length
     / \
    /\ /\
   .......
 ```
 
-We can now define a concept of a "path", a way of describing a function that takes as input an SSZ object and outputs some specific (possibly deeply nested) member. For example, `foo -> foo.x` is a path, as are `foo -> len(foo.y)` and `foo -> foo.y[5].w`. We'll describe paths as lists, which can have two representations. In "human-readable form", they are `["x"]`, `["y", "__len__"]` and `["y", 5, "w"]` respectively. In "encoded form", they are lists of `uint64` values, in these cases (assuming the fields of `foo` in order are `x` then `y`, and `w` is the first field of `y[i]`) `[0]`, `[1, 2**64-1]`, `[1, 5, 0]`.
+We can now define a concept of a "path", a way of describing a function that takes as input an SSZ object and outputs some specific (possibly deeply nested) member. For example, `foo -> foo.x` is a path, as are `foo -> len(foo.y)` and `foo -> foo.y[5].w`. We'll describe paths as lists, which can have two representations. In "human-readable form", they are `["x"]`, `["y", "__len__"]` and `["y", 5, "w"]` respectively. In "encoded form", they are lists of `uint64` values, in these cases `[0]`, `[1, 2**64-1]`, `[1, 5, 0]`.
 
 ```python
 def item_length(typ: Type) -> int:
