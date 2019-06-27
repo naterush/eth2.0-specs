@@ -1,6 +1,6 @@
 # Merkle proof formats
 
-**Notice**: This document is a work-in-progress for researchers and implementers.
+**Notice**: This document is a work-in-progress for researchers and implementers. It gives algorithms for Merkle proof generation and verification for objects that has been Merkleized according to the [SSZ Merkleization spec](https://github.com/ethereum/eth2.0-specs/blob/dev/specs/simple-serialize.md#merkleization).
 
 ## Table of contents
 <!-- TOC -->
