@@ -21,7 +21,7 @@
 
 | Name | Value |
 | - | - |
-| `LENGTH_FLAG` | `2**64 - 1` | 
+| `LENGTH_FLAG` | `2**64 - 1` |
 
 ## Generalized Merkle tree index
 
@@ -74,16 +74,16 @@ def item_length(typ: Type) -> int:
         return typ.byte_len
     else:
         return 32
-        
-        
+
+
 def get_elem_type(typ: Type, index: int) -> Type:
     """
     Returns the type of the element of an object of the given type with the given index
     or member variable name (eg. `7` for `x[7]`, `"foo"` for `x.foo`)
     """
     return typ.get_fields_dict()[index] if is_container_type(typ) else typ.elem_type
-        
-        
+
+
 def get_chunk_count(typ: Type) -> int:
     """
     Returns the number of hashes needed to represent the top-level elements in the given type
@@ -120,6 +120,7 @@ def get_generalized_index(typ: Type, path: List[Union[int, str]]) -> int:
     Converts a path (eg. `[7, "foo", 3]` for `x[7].foo[3]`, `[12, "bar", "__len__"]` for
     `len(x[12].bar)`) into the generalized index representing its position in the Merkle tree.
     """
+    root = 1
     for p in path:
         assert not is_basic_type(typ)  # If we descend to a basic type, the path cannot continue further
         if p == '__len__':
@@ -146,7 +147,7 @@ x x . . . . x *
 
 First, we provide a method for computing the generalized indices of the auxiliary tree nodes that a proof of a given set of generalized indices will require:
 
-```
+```python
 def get_branch_indices(tree_index: int) -> List[int]:
     """
     Get the generalized indices of the sister chunks along the path from the chunk with the
